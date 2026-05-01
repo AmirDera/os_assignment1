@@ -464,7 +464,20 @@ scheduler(void)
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        // After a co_yield direct-switch chain, c->proc may differ
+        // from p; handle lock accounting accordingly.
+        struct proc *last = c->proc;
         c->proc = 0;
+
+        if(!holding(&p->lock)){
+          // We returned from a co_yield chain — p->lock was released
+          // by the direct switch target. Release the correct lock.
+          if(last && last != p && holding(&last->lock))
+            release(&last->lock);
+          else
+            pop_off();
+          continue;
+        }
       }
       release(&p->lock);
     }
@@ -577,6 +590,97 @@ wakeup(void *chan)
       release(&p->lock);
     }
   }
+}
+
+// Unique sleep channel for co_yield.
+// Only the address matters, not the value.
+static int co_yield_chan = 0;
+
+// Return the address of the co_yield sleep channel.
+// Used by the scheduler to skip co_yield sleepers.
+void*
+co_yield_channel(void)
+{
+  return &co_yield_chan;
+}
+
+// Coroutine-style cooperative yield.
+// Yield execution to the process with the given pid,
+// passing it the given value. Returns the value received
+// from the process that yields back to us.
+int
+co_yield(int pid, int value)
+{
+  struct proc *p = myproc();
+  struct proc *target = 0;
+  struct cpu *c = mycpu();
+  int intena;
+
+  // Error: can't yield to self or invalid pid
+  if(pid <= 0 || pid == p->pid)
+    return -1;
+
+  // Find target process (hold target->lock on success)
+  for(target = proc; target < &proc[NPROC]; target++){
+    if(target != p){
+      acquire(&target->lock);
+      if(target->pid == pid)
+        break;
+      release(&target->lock);
+    }
+  }
+
+  // Error: target not found
+  if(target >= &proc[NPROC])
+    return -1;
+
+  // Error: target is killed or not alive
+  if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
+    release(&target->lock);
+    return -1;
+  }
+
+  if(target->state == SLEEPING && target->chan == &co_yield_chan){
+    // Target is already sleeping in co_yield — ready for handoff.
+    // Write our value into target's a0 (safe: target already read its args).
+    target->trapframe->a0 = (uint64)value;
+    target->state = RUNNING;
+
+    // Put ourselves to sleep on the co_yield channel.
+    // Store our value in our own a0 for future retrieval by whoever
+    // yields to us next (they will overwrite it with their value).
+    p->chan = &co_yield_chan;
+    p->state = SLEEPING;
+
+    // Direct switch: bypass the scheduler entirely.
+    c->proc = target;
+    intena = c->intena;
+    swtch(&p->context, &target->context);
+    c->intena = intena;
+  } else {
+    // Target not yet in co_yield — just sleep and wait.
+    // Store our value in our own trapframe a0 so the target can
+    // read it when it eventually calls co_yield and finds us sleeping.
+    release(&target->lock);
+    acquire(&p->lock);
+    p->trapframe->a0 = (uint64)value;
+    p->chan = &co_yield_chan;
+    p->state = SLEEPING;
+    sched();
+  }
+
+  // We've been woken up. Our trapframe->a0 now contains the value
+  // that the other process wrote for us.
+  int received = (int)p->trapframe->a0;
+  p->chan = 0;
+
+  if(p->killed){
+    release(&p->lock);
+    return -1;
+  }
+
+  release(&p->lock);
+  return received;
 }
 
 // Kill the process with the given pid.
