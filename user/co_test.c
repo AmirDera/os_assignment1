@@ -12,12 +12,12 @@ main(int argc, char *argv[])
   ret = co_yield(9999, 42);
   printf("co_yield(9999, 42) = %d (expected -1)\n", ret);
 
-  // (c) Attempt to yield to self
+  // (b) Attempt to yield to self
   printf("Test (c): self-yield\n");
   ret = co_yield(getpid(), 42);
   printf("co_yield(self, 42) = %d (expected -1)\n", ret);
 
-  // (b) Attempt to yield to a killed process
+  // (c) Attempt to yield to a killed process
   printf("Test (b): killed process\n");
   int pid_killed = fork();
   if(pid_killed == 0){
